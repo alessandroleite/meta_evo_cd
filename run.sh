@@ -1,0 +1,1 @@
+python -m meta_evo_cd.run --generations 8 --pop 24 --task_batch 8 --seed 42
