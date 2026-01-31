@@ -1,18 +1,57 @@
 from __future__ import annotations
 import argparse
 import os
-from dataclasses import asdict, replace
-from typing import Callable, Dict, List, Optional
+from dataclasses import asdict
+from typing import List
+from collections import Counter
+
 import numpy as np
 from numpy.random import default_rng
 
 from .pipelines import PipelineConfig, random_config, mutate, crossover
 from .run import evaluate_cfg_on_tasks
 from .evo import select_nsga2, Individual
-from .meta_protocol import sample_train_tasks
-from .logging_utils import ensure_dir, append_jsonl
+from .meta_protocol import sample_train_tasks, sample_test_tasks_shifted, make_shift_suite
+from .logging_utils import ensure_dir, append_jsonl, append_csv
 from .meta_test import load_selected_cfgs
-from .meta_protocol import sample_test_tasks_shifted, make_shift_suite
+
+
+FAM_COLS = [
+    "task_linear",
+    "task_tanh_quad_clip",
+    "task_tanh_quad_bounded",
+    "task_poly3_clip",
+    "task_post_nonlinear",
+    "task_relu_smooth_clip",
+    "task_frac_nonlinear",
+]
+
+
+def summarize_task_batch(tasks) -> dict:
+    """
+    Summarize the sampled task batch so logs are interpretable.
+    Tasks without nonlinear_spec are counted as 'linear'.
+    """
+    fams = []
+    for t in tasks:
+        nl = getattr(t, "nonlinear_spec", None)
+        fams.append(nl.family if nl is not None else "linear")
+    c = Counter(fams)
+    return {str(k): int(v) for k, v in c.items()}
+
+
+def family_cols(task_family_counts: dict, total_tasks: int) -> dict:
+    nonlinear_total = total_tasks - int(task_family_counts.get("linear", 0))
+    return {
+        "task_linear": int(task_family_counts.get("linear", 0)),
+        "task_tanh_quad_clip": int(task_family_counts.get("tanh_quad_clip", 0)),
+        "task_tanh_quad_bounded": int(task_family_counts.get("tanh_quad_bounded", 0)),
+        "task_poly3_clip": int(task_family_counts.get("poly3_clip", 0)),
+        "task_post_nonlinear": int(task_family_counts.get("post_nonlinear", 0)),
+        "task_relu_smooth_clip": int(task_family_counts.get("relu_smooth_clip", 0)),
+        "task_frac_nonlinear": float(nonlinear_total) / max(1, total_tasks),
+    }
+
 
 # ---- helpers to constrain the genome ----
 
@@ -47,6 +86,7 @@ def constrain_cfg(cfg: PipelineConfig, mode: str, rng: np.random.Generator) -> P
     d["seed"] = int(rng.integers(0, 10**9))
     return PipelineConfig(**d)
 
+
 def evolve_one(mode: str, outdir: str, seed: int, generations: int, pop: int, task_batch: int):
     ensure_dir(outdir)
     rng = default_rng(seed)
@@ -55,15 +95,19 @@ def evolve_one(mode: str, outdir: str, seed: int, generations: int, pop: int, ta
 
     for gen in range(generations):
         tasks = sample_train_tasks(rng, task_batch)
+        task_family_counts = summarize_task_batch(tasks)
+        extras = family_cols(task_family_counts, total_tasks=len(tasks))
+
         evaled: List[Individual] = [evaluate_cfg_on_tasks(cfg, tasks) for cfg in pop_cfgs]
         sel = select_nsga2(evaled, n_keep=max(2, pop // 3))
 
         sel_sorted = sorted(sel, key=lambda ind: (ind.obj[0], ind.obj[1], ind.obj[3]))
         best = sel_sorted[0]
-        print(f"[{mode} gen {gen}] best meta={best.meta} cfg={asdict(best.cfg)}")
+        print(f"[{mode} gen {gen}] best meta={best.meta} cfg={asdict(best.cfg)} task_mix={task_family_counts}")
 
         # log best only (keeps ablation lightweight)
-        append_jsonl(f"{outdir}/train_best.jsonl", {"mode": mode, "gen": gen, **best.meta, **asdict(best.cfg)})
+        row_jsonl = {"mode": mode, "gen": gen, **best.meta, **asdict(best.cfg), **extras, "task_family_counts": task_family_counts}
+        append_jsonl(f"{outdir}/train_best.jsonl", row_jsonl)
 
         # offspring
         new_pop = [ind.cfg for ind in sel]
@@ -81,18 +125,43 @@ def evolve_one(mode: str, outdir: str, seed: int, generations: int, pop: int, ta
     final_cfgs = [asdict(ind.cfg) for ind in sel_sorted[:5]]
     append_jsonl(f"{outdir}/final_selected.jsonl", {"seed": seed, "mode": mode, "final": final_cfgs})
 
+
 def meta_test_run(run_dir: str, seed: int, test_tasks: int = 24, top_k: int = 5):
     rng = default_rng(seed)
+
     # load final configs
     cfgs = load_selected_cfgs(f"{run_dir}/final_selected.jsonl", top_k=top_k)
     shifts = make_shift_suite()
-    out = f"{run_dir}/meta_test.jsonl"
+
+    out_jsonl = f"{run_dir}/meta_test.jsonl"
+    out_csv = f"{run_dir}/meta_test.csv"
+
+    base_header = [
+        "shift", "cfg_rank",
+        "mean_shd", "mean_ace_err", "mean_stability", "mean_time",
+        "skeleton", "alpha", "max_cond_set", "corr_thresh", "max_edges",
+        "orient", "meek_passes", "prune_marginal_alpha",
+    ]
+    header = base_header + FAM_COLS
+
     for shift in shifts:
         tasks = sample_test_tasks_shifted(rng, test_tasks, shift=shift)
+
+        # summarize once per shift (same task batch for all cfgs)
+        task_family_counts = summarize_task_batch(tasks)
+        extras = family_cols(task_family_counts, total_tasks=len(tasks))
+
         for r, cfg in enumerate(cfgs):
             ind = evaluate_cfg_on_tasks(cfg, tasks)
-            append_jsonl(out, {"shift": shift, "cfg_rank": r, **ind.meta, **asdict(cfg)})
-            print(f"[meta-test {os.path.basename(run_dir)}] {shift} cfg#{r} meta={ind.meta}")
+
+            row_csv = {"shift": shift, "cfg_rank": r, **ind.meta, **asdict(cfg), **extras}
+            row_jsonl = {**row_csv, "task_family_counts": task_family_counts}
+
+            append_jsonl(out_jsonl, row_jsonl)
+            append_csv(out_csv, row_csv, header=header)
+
+            print(f"[meta-test {os.path.basename(run_dir)}] {shift} cfg#{r} meta={ind.meta} task_mix={task_family_counts}")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -110,11 +179,22 @@ def main():
 
     for i, mode in enumerate(modes):
         run_dir = f"{args.outroot}/{mode}"
-        evolve_one(mode, run_dir, seed=args.seed + 100*i, generations=args.generations,
-                  pop=args.pop, task_batch=args.task_batch)
-        meta_test_run(run_dir, seed=args.seed + 999 + 100*i, test_tasks=args.test_tasks, top_k=5)
+        evolve_one(
+            mode, run_dir,
+            seed=args.seed + 100 * i,
+            generations=args.generations,
+            pop=args.pop,
+            task_batch=args.task_batch,
+        )
+        meta_test_run(
+            run_dir,
+            seed=args.seed + 999 + 100 * i,
+            test_tasks=args.test_tasks,
+            top_k=5,
+        )
 
-    print(f"\nAblations done. See {args.outroot}/<mode>/train_best.jsonl and meta_test.jsonl")
+    print(f"\nAblations done. See {args.outroot}/<mode>/train_best.jsonl, meta_test.csv, and meta_test.jsonl")
+
 
 if __name__ == "__main__":
     main()

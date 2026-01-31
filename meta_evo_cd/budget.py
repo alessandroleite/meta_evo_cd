@@ -33,7 +33,8 @@ def evaluate_cfg_budgeted(cfg,
         # simulate data
         rng_t = default_rng(t.seed)
         A_true = random_dag(t.d, t.expected_degree, rng_t)
-        X = simulate_sem(A_true, t.n, t.sem_type, t.noise_type, t.noise_scale, rng_t)
+        X = simulate_sem(A_true, t.n, t.sem_type, t.noise_type, t.noise_scale, rng_t, 
+                         nonlinear_spec=t.nonlinear_spec)
 
         t0 = time.perf_counter()
         dag_hat = discover_fn(X, cfg)
